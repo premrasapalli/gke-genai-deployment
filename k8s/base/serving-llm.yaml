@@ -22,12 +22,21 @@ spec:
         runAsUser: 1001
       initContainers:
         - name: load-model
-          image: gcr.io/<PROJECT_ID>/genai/model-loader:1.0.0
+          image: genai/model-loader:1.0.0
           env:
             - name: HF_MODEL
               value: "Qwen/Qwen2.5-0.5B-Instruct"
             - name: HF_DEST
               value: /models
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-secret
+                  key: hf-token
+                  # optional: open models don't need a token; only set the secret
+                  # for gated models. Without `optional` the pod would fail to
+                  # start when hf-secret is absent.
+                  optional: true
           securityContext:
             allowPrivilegeEscalation: false
           volumeMounts:
@@ -35,7 +44,7 @@ spec:
               mountPath: /models
       containers:
         - name: llm
-          image: vllm/vllm-openai:latest
+          image: vllm/vllm-openai:v0.9.0
           command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
           args:
             - --model

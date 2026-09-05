@@ -11,9 +11,35 @@ spec:
       template:
         spec:
           restartPolicy: OnFailure
+          initContainers:
+            - name: seed-docs
+              # Copies a GCS bucket of source docs into the shared rag-data PVC
+              # before the ingest container indexes them. Set DOCS_GCS_URI to a
+              # GCS bucket path (gs://my-bucket/docs) OR remove this initContainer
+              # and copy docs into the PVC manually (e.g. kubectl cp).
+              image: google/cloud-sdk:slim
+              imagePullPolicy: IfNotPresent
+              command: ["sh", "-c"]
+              args:
+                - |
+                  set -e
+                  if [ -n "${DOCS_GCS_URI:-}" ]; then
+                    echo "Seeding docs from ${DOCS_GCS_URI}"
+                    gsutil -m rsync -r "${DOCS_GCS_URI}" /data/docs
+                  else
+                    echo "DOCS_GCS_URI not set; using whatever is already in /data/docs"
+                  fi
+              env:
+                - name: DOCS_GCS_URI
+                  value: ""
+                # The GKE workload identity service account must have
+                # roles/storage.objectViewer on the bucket.
+              volumeMounts:
+                - name: rag-data
+                  mountPath: /data
           containers:
             - name: ingest
-              image: gcr.io/<PROJECT_ID>/genai/rag:1.0.0
+              image: genai/rag:1.0.0
               command: ["python", "-m", "ingest", "--dir", "/data/docs"]
               env:
                 - name: RAG_PERSIST_DIR

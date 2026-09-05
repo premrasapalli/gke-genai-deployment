@@ -46,7 +46,7 @@ resource "google_container_node_pool" "gpu" {
   node_count = 1
 
   node_config {
-    machine_type = "g2-standard-12" # 1 x NVIDIA L4 GPU; large GPU models need more
+    machine_type    = "g2-standard-12" # 1 x NVIDIA L4 GPU; large GPU models need more
     service_account = google_service_account.gke.email
     oauth_scopes = [
       "https://www.googleapis.com/auth/cloud-platform",
@@ -63,4 +63,13 @@ resource "google_artifact_registry_repository" "docker" {
   repository_id = "genai"
   format        = "DOCKER"
   description   = "GenAI serving, RAG and gateway images"
+}
+
+# Global static IP for the gateway ingress (GCE L7 load balancer).
+# Reference it from the ingress via:
+#   kubernetes.io/ingress.global-static-ip-name: genai-gateway-ip
+resource "google_compute_global_address" "genai_gateway" {
+  name         = "genai-gateway-ip"
+  project      = var.project_id
+  address_type = "EXTERNAL"
 }

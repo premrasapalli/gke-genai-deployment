@@ -5,9 +5,12 @@ metadata:
   namespace: genai
 spec:
   accessModes:
-    - ReadWriteMany
+    # The model is only consumed by a single serving-llm pod (init + main share
+    # it), so ReadWriteOnce suffices and lets us use the low-latency pd-ssd class.
+    - ReadWriteOnce
   resources:
     requests:
       storage: 50Gi
-  storageClassName: standard-rwo
-  # For larger GPU models consider GKE Filestore / GCS FUSE instead.
+  storageClassName: pd-ssd
+  # For larger GPU models or sharing one model across many replicas, use GKE
+  # Filestore or GCS FUSE instead of block storage.

@@ -5,7 +5,14 @@ metadata:
   namespace: genai
 spec:
   accessModes:
+    # Shared by rag-service and the ingest CronJob (separate pods), so it must
+    # be ReadWriteMany. GCE `standard-rwo`/`pd-ssd` are RWO-only — use a class
+    # that supports RWX, e.g. GKE Filestore CSI (`nfs`) or NetApp, and set it
+    # below. Without this the ingest pod cannot mount while rag-service is up.
     - ReadWriteMany
   resources:
     requests:
-      storage: 10Gi
+      storage: 20Gi
+  # storageClassName: nfs-filestore   # <-- set to your RWX-capable class
+  # Sizing: Chroma persists embeddings + metadata here. 20Gi is a starting
+  # point; grow it with your document corpus (watch ChromeCollection growth).

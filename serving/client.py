@@ -1,9 +1,10 @@
+import os
 import time
 
 import requests
 
-BASE = "http://localhost:8000/v1"
-MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+BASE = os.environ.get("VLLM_URL", "http://localhost:8000/v1")
+MODEL = os.environ.get("VLLM_MODEL", "genai-model")
 
 
 def wait_ready(timeout: int = 600) -> bool:

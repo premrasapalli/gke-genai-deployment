@@ -13,3 +13,7 @@ output "artifact_registry" {
 output "gpu_pool_id" {
   value = google_container_node_pool.gpu.name
 }
+
+output "gateway_static_ip" {
+  value = google_compute_global_address.genai_gateway.address
+}

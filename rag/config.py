@@ -15,7 +15,7 @@ PERSIST_DIR = os.environ.get("RAG_PERSIST_DIR", "/data/chroma")
 EMBEDDING_BASE_URL = os.environ.get(
     "EMBEDDING_BASE_URL", "http://serving-embedding:8001/v1"
 )
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 EMBEDDING_KEY = os.environ.get("EMBEDDING_API_KEY", "EMPTY")
 
 
