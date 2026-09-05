@@ -1,0 +1,79 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: serving-llm
+  namespace: genai
+  labels:
+    app: serving-llm
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: serving-llm
+  template:
+    metadata:
+      labels:
+        app: serving-llm
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+      initContainers:
+        - name: load-model
+          image: gcr.io/<PROJECT_ID>/genai/model-loader:1.0.0
+          env:
+            - name: HF_MODEL
+              value: "Qwen/Qwen2.5-0.5B-Instruct"
+            - name: HF_DEST
+              value: /models
+          securityContext:
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - name: model-store
+              mountPath: /models
+      containers:
+        - name: llm
+          image: vllm/vllm-openai:latest
+          command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+          args:
+            - --model
+            - /models
+            - --served-model-name
+            - genai-model
+            - --port
+            - "8000"
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: HF_HOME
+              value: /models
+            - name: VLLM_WORKER_MULTIPROC_METHOD
+              value: spawn
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 4
+              memory: 8Gi
+            limits:
+              memory: 12Gi
+          volumeMounts:
+            - name: model-store
+              mountPath: /models
+      volumes:
+        - name: model-store
+          persistentVolumeClaim:
+            claimName: model-store

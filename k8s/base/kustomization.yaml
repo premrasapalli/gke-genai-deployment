@@ -1,0 +1,30 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: genai
+resources:
+  - namespace.yaml
+  - pvc-model.yaml
+  - pvc-rag.yaml
+  - serving-llm.yaml
+  - serving-embedding.yaml
+  - rag-service.yaml
+  - gateway.yaml
+  - svc-serving-llm.yaml
+  - svc-serving-embedding.yaml
+  - svc-rag-service.yaml
+  - svc-gateway.yaml
+  - ingress.yaml
+  - ingest-cronjob.yaml
+images:
+  - name: gcr.io/<PROJECT_ID>/genai/model-loader
+    newName: gcr.io/<PROJECT_ID>/genai/model-loader
+    newTag: "1.0.0"
+  - name: gcr.io/<PROJECT_ID>/genai/vllm
+    newName: vllm/vllm-openai
+    newTag: latest
+  - name: gcr.io/<PROJECT_ID>/genai/rag
+    newName: gcr.io/<PROJECT_ID>/genai/rag
+    newTag: "1.0.0"
+  - name: gcr.io/<PROJECT_ID>/genai/gateway
+    newName: gcr.io/<PROJECT_ID>/genai/gateway
+    newTag: "1.0.0"

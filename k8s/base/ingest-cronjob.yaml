@@ -1,0 +1,31 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: rag-ingest
+  namespace: genai
+spec:
+  schedule: "0 */6 * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: ingest
+              image: gcr.io/<PROJECT_ID>/genai/rag:1.0.0
+              command: ["python", "-m", "ingest", "--dir", "/data/docs"]
+              env:
+                - name: RAG_PERSIST_DIR
+                  value: /data/chroma
+                - name: EMBEDDING_BASE_URL
+                  value: http://serving-embedding:8001
+                - name: EMBEDDING_MODEL
+                  value: BAAI/bge-small-en-v1.5
+              volumeMounts:
+                - name: rag-data
+                  mountPath: /data
+          volumes:
+            - name: rag-data
+              persistentVolumeClaim:
+                claimName: rag-data
