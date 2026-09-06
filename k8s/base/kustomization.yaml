@@ -3,8 +3,10 @@ kind: Kustomization
 namespace: genai
 resources:
   - namespace.yaml
+  - storageclass-filestore.yaml
   - pvc-model.yaml
   - pvc-rag.yaml
+  - pvc-embed.yaml
   - serving-llm.yaml
   - serving-embedding.yaml
   - rag-service.yaml

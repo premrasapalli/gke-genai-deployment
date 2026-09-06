@@ -6,7 +6,7 @@ WORKDIR /gateway
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app ./
+COPY app/ ./app/
 COPY run.sh .
 
 EXPOSE 8080

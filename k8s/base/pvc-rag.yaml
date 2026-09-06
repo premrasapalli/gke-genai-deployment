@@ -13,6 +13,8 @@ spec:
   resources:
     requests:
       storage: 20Gi
-  # storageClassName: nfs-filestore   # <-- set to your RWX-capable class
+  storageClassName: nfs-filestore
   # Sizing: Chroma persists embeddings + metadata here. 20Gi is a starting
   # point; grow it with your document corpus (watch ChromeCollection growth).
+  # Note: Filestore instances have a ~1TB (basic-hdd) minimum, so the billed
+  # capacity is the instance size, not the PVC request.

@@ -12,6 +12,7 @@ venv/
 .terraform/
 *.tfstate*
 *.tfvars
+*.tfplan
 
 # K8s local
 kubeconfig*

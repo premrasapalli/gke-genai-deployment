@@ -41,9 +41,14 @@ resource "google_container_node_pool" "cpu" {
 }
 
 resource "google_container_node_pool" "gpu" {
+  count      = var.enable_gpu_pool ? 1 : 0
   name       = "gpu-pool"
   cluster    = google_container_cluster.genai.id
   node_count = 1
+  # nvidia-l4 (L4) is NOT offered in every us-central1 zone (e.g. not -f).
+  # Pin to a zone that has L4; otherwise GKE picks a random zone and the create
+  # fails with "Accelerator type nvidia-l4 does not exist in zone <...>".
+  node_locations = [var.gpu_zone]
 
   node_config {
     machine_type    = "g2-standard-12" # 1 x NVIDIA L4 GPU; large GPU models need more
@@ -55,6 +60,9 @@ resource "google_container_node_pool" "gpu" {
       type  = "nvidia-l4"
       count = 1
     }
+    # Set node_config.guest_accelerator gpu_driver_installation or let GKE
+    # auto-install the default driver on GKE >= 1.32. If you run the vendored
+    # driver DaemonSet, don't also auto-install.
   }
 }
 

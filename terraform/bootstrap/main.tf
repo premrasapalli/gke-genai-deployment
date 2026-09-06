@@ -32,7 +32,7 @@ variable "region" {
 variable "state_bucket" {
   type        = string
   description = "GCS bucket name for Terraform remote state"
-  default     = "genai-terraform-state"
+  default     = "aiml-project-idp-genai-tfstate"
 }
 
 provider "google" {

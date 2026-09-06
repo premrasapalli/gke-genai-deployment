@@ -11,7 +11,7 @@ output "artifact_registry" {
 }
 
 output "gpu_pool_id" {
-  value = google_container_node_pool.gpu.name
+  value = try(google_container_node_pool.gpu[0].name, "")
 }
 
 output "gateway_static_ip" {

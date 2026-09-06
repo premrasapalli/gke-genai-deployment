@@ -18,6 +18,7 @@ spec:
       containers:
         - name: rag
           image: genai/rag:1.0.0
+          imagePullPolicy: Always
           command: ["uvicorn", "service:app", "--host", "0.0.0.0", "--port", "8080"]
           ports:
             - name: http
@@ -32,7 +33,7 @@ spec:
             - name: LLM_BASE_URL
               value: http://serving-llm:8000/v1
             - name: LLM_MODEL
-              value: genai-model
+              value: qwen2.5:0.5b
           readinessProbe:
             httpGet:
               path: /healthz

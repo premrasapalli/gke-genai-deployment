@@ -70,7 +70,7 @@ gcloud auth application-default login
 terraform init && terraform plan && terraform apply
 ```
 
-`backend.tf` expects the GCS bucket `genai-terraform-state`
+`backend.tf` expects the GCS bucket `aiml-project-idp-genai-tfstate`
 (created by bootstrap) for remote state. `terraform apply` creates
 `genai-cluster` (e2-standard-8 CPU pool + g2-standard-12 GPU pool with L4), the
 `genai` Artifact Registry, and reserves `genai-gateway-ip` (a global static IP

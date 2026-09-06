@@ -1,4 +1,4 @@
-chromadb==0.5.5
+chromadb==0.4.24
 langchain==0.3.7
 langchain-community==0.3.7
 langchain-chroma==0.1.4

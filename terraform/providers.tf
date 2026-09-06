@@ -23,3 +23,15 @@ variable "region" {
   description = "GCP region"
   default     = "us-central1"
 }
+
+variable "enable_gpu_pool" {
+  type        = bool
+  description = "Create the GPU (L4) node pool. Requires regional quota NVIDIA_L4_GPUS > 0 (GCP default is 0; request an increase)."
+  default     = false
+}
+
+variable "gpu_zone" {
+  type        = string
+  description = "Zone that hosts NVIDIA L4 GPUs. L4 is not offered in every us-central1 zone (e.g. not -f); pick us-central1-a/b/c."
+  default     = "us-central1-a"
+}
