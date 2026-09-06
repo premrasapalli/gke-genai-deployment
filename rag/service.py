@@ -11,7 +11,7 @@ app = FastAPI(title="RAG Service")
 
 class AnswerRequest(BaseModel):
     query: str
-    k: int = Field(default=4, ge=1, le=10)
+    k: int = Field(default=12, ge=1, le=20)
 
 
 class AnswerResponse(BaseModel):

@@ -17,10 +17,19 @@ similarity search and passes the top-k chunks into the prompt as context.
 
 ## API Gateway
 
-A FastAPI gateway routes traffic:
-- `POST /chat` -> LLM chat completion
-- `POST /rag` -> retrieve context, then generate a grounded answer
-- `GET /models` -> list served models
+A FastAPI gateway is the single front door of the platform. It exposes:
+
+| Endpoint | Method | What it does                                            |
+| -------- | ------ | ------------------------------------------------------- |
+| `/healthz` | GET | Liveness check; returns `{"status":"ok"}`.            |
+| `/models`  | GET | Reports which LLM is being served (e.g. `qwen2.5:0.5b`). |
+| `/chat`    | POST | Sends a prompt to the LLM and returns the plain chat answer. |
+| `/rag`     | POST | Retrieves relevant document chunks from Chroma, then generates a grounded answer. |
+
+Example chat call: `POST /chat` with `{"prompt": "What is a token?"}` returns
+`{"answer": "..."}`. Example RAG call: `POST /rag` with
+`{"query": "How are models served?"}` returns an answer grounded in this
+knowledge base.
 
 ## Infrastructure
 

@@ -13,17 +13,17 @@ LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://serving-llm:8000/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "genai-model")
 
 
-def _build_context(query: str, k: int = 4) -> str:
+def _build_context(query: str, k: int = 12, max_score: float = 0.6) -> str:
     hits = retrieve(query, k=k)
     parts = []
     for i, (doc, score) in enumerate(hits, 1):
-        parts.append(
-            f"[{i}] (score={score:.3f})\n{doc.page_content.strip()}"
-        )
-    return "\n\n".join(parts)
+        if score > max_score:
+            continue
+        parts.append(doc.page_content.strip())
+    return "\n\n---\n\n".join(parts)
 
 
-def rag_answer(query: str, k: int = 4) -> str:
+def rag_answer(query: str, k: int = 12) -> str:
     client = OpenAI(base_url=LLM_BASE_URL, api_key="EMPTY")
     context = _build_context(query, k)
 
@@ -31,14 +31,16 @@ def rag_answer(query: str, k: int = 4) -> str:
         {
             "role": "system",
             "content": (
-                "You are a precise assistant. Answer ONLY from the provided "
-                "context. If the context does not contain the answer, say you "
-                "don't know. Cite the context section number."
+                "You are a precise assistant. Write a direct, concise answer "
+                "to the user's question using ONLY the given context. Give the "
+                "question a plain prose answer. Do NOT quote, number, cite, or "
+                "restate the context fragments themselves. If no context is "
+                "relevant to the question, reply exactly with: I don't know."
             ),
         },
         {
             "role": "user",
-            "content": f"Context:\n{context}\n\nQuestion: {query}",
+            "content": f"Question: {query}\n\nContext:\n{context}",
         },
     ]
     resp = client.chat.completions.create(
