@@ -1,4 +1,4 @@
-# Implementation — Step by Step to Make It Live (and why, at each step)
+# Implementation Guide — Step by Step to Make It Live
 
 This is the exact order of operations used to bring this platform from nothing
 to a live public URL. Every step includes **why you add it** so you can extend
@@ -102,6 +102,7 @@ Automate what is deterministic: seed step in CI when docs change, and a cronjob
 re-ingest every 6h to absorb edits automatically.
 
 ## Phase G — Smoke test the live contract. Why?
+
 A "deployed" system is only done when its API contract is proven from outside:
 
 ```bash
