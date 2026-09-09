@@ -14,6 +14,7 @@ An end-to-end LLM/GenAI deployment stack for Google Cloud (GKE):
 > Images live in Artifact Registry (`us-central1-docker.pkg.dev/aiml-project-idp/genai`),
 > NOT `gcr.io`.
 
+
 ## Architecture
 
 ```
