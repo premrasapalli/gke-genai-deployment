@@ -217,3 +217,5 @@ use Filestore only if you must share one model across replicas).
 | RAG      | `EMBEDDING_BASE_URL`, `EMBEDDING_MODEL`, `LLM_BASE_URL`, `LLM_MODEL`, `RAG_PERSIST_DIR` | TEI :8001/v1, `BAAI/bge-small-en-v1.5`, vLLM :8000/v1, `genai-model`, /data/chroma |
 | vLLM     | `HF_MODEL` (initContainer), optional `HF_TOKEN` | `Qwen/Qwen2.5-0.5B-Instruct` |
 
+
+
