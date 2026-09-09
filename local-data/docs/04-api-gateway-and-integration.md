@@ -1,174 +1,215 @@
-# API Gateway & Service Integration
+# API Gateway & Service Integration — From 0 to Live
 
-This file covers the API gateway (the single entry point) and how all services
-integrate: who talks to whom, how they discover each other, and hop-by-hop
-request traces.
-
----
-
-# The API Gateway
-
-The **API gateway** is a FastAPI application (a Python web framework) that is
-the single entry point into the whole AI system. It lives in the `gateway/`
-directory and runs as the `gateway` Kubernetes deployment.
-
-## Why have a gateway at all?
-
-The internals — the LLM server, the embedding server, the RAG service — each
-have their own addresses and details. A frontend or a CLI should not need to
-know about any of them. The gateway gives clients:
-
-- **One stable URL and port** (port 80 via the `gateway` Service).
-- **Simple, stable endpoints.**
-- **Optional API-key authentication.**
-
-It also hides which model server is installed underneath (Ollama vs vLLM).
-
-## The endpoints
-
-- `POST /chat` — a plain chat with the LLM. You send messages; it streams/returns
-  the model's reply.
-- `POST /rag` — ask a question grounded in your documents. The gateway forwards
-  to the rag service, which does retrieval and generation.
-- `GET /models` — lists the models the serving backend currently has loaded.
-- `GET /healthz` — readiness/health check used by Kubernetes probes.
-
-## How the gateway talks to everything
-
-The gateway is configured entirely with environment variables:
-
-- `LLM_URL` — where the LLM lives (defaults to `http://serving-llm:8000/v1`).
-- `LLM_MODEL` — the served model name (e.g. `qwen2.5:0.5b` or `genai-model`).
-- `RAG_URL` — the rag service (defaults to `http://rag-service:8080`).
-- `API_KEY` — optional shared secret for `X-API-Key` header auth.
-
-Because these are just values in the Kubernetes manifest, pointing the whole
-system at a different model or backend is a config change, not a code change.
+Every step below is a real command to deploy, test, trace, and debug the API
+gateway and the full service-to-service integration.
 
 ---
 
-# How All the Services Integrate
+# The API Gateway — From 0 to Live
 
-The platform is not one program — it is several **microservices** that cooperate
-over the network.
+## Deploy the gateway
 
-## The cast of services
+```bash
+kubectl apply -k k8s/overlays/prod
+kubectl -n genai rollout status deploy/gateway
+```
 
-| Service | What it does | Port |
-|---------|--------------|------|
-| gateway | Public entry point, FastAPI routers | 80 |
-| serving-llm | The LLM (Ollama in CPU mode, vLLM in GPU mode) | 8000 |
-| serving-embedding | TEI embeddings | 8001 |
-| rag-service | Retrieval + grounded answer | 8080 |
-| rag-ingest | CronJob that indexes documents | (job) |
+## Verify it is alive
 
-## How they find each other
+```bash
+kubectl -n genai get deploy gateway
+kubectl -n genai logs deploy/gateway --tail=10
 
-Kubernetes gives every service a stable **DNS name** that equals the service
-name. Inside the cluster, `http://serving-llm:8000` reaches the LLM, and
-`http://rag-service:8080` reaches the RAG service. The manifests wire these up
-through **environment variables**, so reconfiguring where something points is a
-single, visible config change.
+# Port-forward and health-check
+kubectl port-forward -n genai svc/gateway 8080:80 >/dev/null 2>&1 &
+PF=$!; sleep 3
+curl -s http://localhost:8080/healthz    # {"status":"ok"}
+curl -s http://localhost:8080/models     # qwen2.5:0.5b
+kill $PF
+```
 
-## Integration point: OpenAI-compatible APIs
+## Test every endpoint
 
-The clever design choice is that the LLM (Ollama or vLLM) and the embedding
-server (TEI) both expose **OpenAI-compatible** endpoints. That means:
+```bash
+kubectl port-forward -n genai svc/gateway 8080:80 >/dev/null 2>&1 &
+PF=$!; sleep 3
 
-- The gateway and the RAG chain use the standard OpenAI Python client.
-- The same client code works whether the backend is vLLM (GPU) or Ollama (CPU).
-- The only thing that changes is the base URL and the model name — never the
-  calling code.
+# GET /healthz
+curl -s http://localhost:8080/healthz
+
+# GET /models
+curl -s http://localhost:8080/models
+
+# POST /chat
+curl -s -X POST http://localhost:8080/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"What is a token?"}]}'
+
+# POST /rag
+curl -s -X POST http://localhost:8080/rag \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"What endpoints does the gateway expose?"}'
+
+kill $PF
+```
+
+## Gateway environment configuration
+
+```bash
+kubectl -n genai get deploy gateway -o jsonpath='{.spec.template.spec.containers[0].env}' | python3 -m json.tool
+```
+
+Key vars:
+
+| Var | Value | Why |
+|-----|-------|-----|
+| `LLM_URL` | `http://serving-llm:8000/v1` | Where the LLM lives |
+| `LLM_MODEL` | `qwen2.5:0.5b` | Must match the served model |
+| `RAG_URL` | `http://rag-service:8080` | Where the RAG service lives |
+| `API_KEY` | (optional) | Shared secret for `X-API-Key` auth |
 
 ---
 
-# End-to-End Integration Flow
+# How All Services Integrate — Hop-by-Hop Traces
 
-## Network topology (ClusterIP DNS names)
+## Service inventory
 
-| Service            | DNS name                          | Port | Serves                     |
-|--------------------|-----------------------------------|------|----------------------------|
-| gateway            | `gateway` / via LB 34.63.204.167  | 80   | the public entry point     |
-| rag-service        | `rag-service`                     | 8080 | retrieval + RAG chain      |
-| serving-embedding  | `serving-embedding`               | 8001 | text embeddings (TEI)      |
-| serving-llm        | `serving-llm`                     | 8000 | chat completions (Ollama)  |
+| Service | DNS name | Port | Talks to |
+|---------|----------|------|----------|
+| gateway | `gateway` | 80 | serving-llm, rag-service |
+| serving-llm | `serving-llm` | 8000 | — (receives calls) |
+| serving-embedding | `serving-embedding` | 8001 | — (receives calls) |
+| rag-service | `rag-service` | 8080 | serving-embedding, Chroma, serving-llm |
 
-Kubernetes Services give each workload a stable DNS name **and** load-balance
-across its pods. Why that matters: pods come and go, but `serving-llm` never
-changes, so the gateway config never changes.
+```bash
+# See all services and their IPs
+kubectl -n genai get svc
+```
 
-## Hop-by-hop, /chat (plain conversation)
+## How they discover each other
+
+Kubernetes gives each service a stable DNS name equal to its service name:
+
+```bash
+# Test DNS resolution from inside the cluster
+kubectl -n genai exec deploy/gateway -- nslookup serving-llm
+kubectl -n genai exec deploy/gateway -- nslookup rag-service
+kubectl -n genai exec deploy/gateway -- nslookup serving-embedding
+```
+
+---
+
+## Trace: /chat (plain conversation)
 
 ```
 Client ──► gateway (/chat)
               │ POST {messages:[...]}  with model = LLM_MODEL
               ▼
           serving-llm (/v1/chat/completions, OpenAI-compatible)
-              │ stream-generation of tokens
+              │
               ▼
           gateway returns {answer} ──► client
 ```
-**Why each hop:**
-- gateway -> LLM: the LLM needs an OpenAI-compatible body (`model`,
-  `messages`, `temperature`). The gateway translates the user's simple payload.
-- The response shape (`choices[0].message.content`) is OpenAI-standard, so
-  swapping vLLM<->Ollama never touches the gateway code.
 
-## Hop-by-hop, /rag (grounded answer)
+**Verify live:**
+
+```bash
+kubectl port-forward -n genai svc/gateway 8080:80 >/dev/null 2>&1 &
+PF=$!; sleep 3
+
+# Watch gateway logs in another terminal — you will see the LLM call
+kubectl -n genai logs deploy/gateway -f &
+LOG=$!
+
+curl -s -X POST http://localhost:8080/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Say hello"}]}'
+
+sleep 2; kill $LOG $PF
+```
+
+---
+
+## Trace: /rag (grounded answer)
 
 ```
 Client ──► gateway (/rag)
-              │ POST {query, k:4}
+              │ POST {query}
               ▼
           rag-service (/answer)
-              │ 1) embed the query via serving-embedding (bge-small-en-v1.5)
-              │ 2) similarity-search Chroma (knowledge_base) for k chunks
-              │ 3) build a grounded prompt from the chunks
-              │ 4) call serving-llm to generate the answer from THAT context
+              │ 1) embed query via serving-embedding (bge-small-en-v1.5)
+              │ 2) similarity-search Chroma for top-k chunks
+              │ 3) build grounded prompt from chunks
+              │ 4) call serving-llm to generate from that context
               ▼
           gateway returns {answer} ──► client
 ```
 
-| Step | Why each hop exists                              |
-|------|--------------------------------------------------|
-| query -> embedding | the query must be in the same vector space as the docs, using the SAME model used at ingest (bge-small-en-v1.5). Mismatch = nonsense retrieval |
-| embed -> Chroma | the vector index (on the shared `rag-data` volume) is the docs' semantic memory |
-| chunks -> LLM prompt | grounded prompt: "answer only from Context", then chunk text — reduces hallucination by constraining the model |
-| LLM -> answer | the transformers model turns retrieved facts into a natural-language answer |
+| Step | Why each hop exists |
+|------|---------------------|
+| query -> embedding | query must live in the same vector space as the docs |
+| embed -> Chroma | vector index is the docs' semantic memory |
+| chunks -> LLM prompt | grounded prompt constrains the model to facts |
+| LLM -> answer | model turns retrieved facts into natural language |
 
-## Hop-by-hop, ingestion (offline path)
+**Verify live:**
+
+```bash
+kubectl port-forward -n genai svc/gateway 8080:80 >/dev/null 2>&1 &
+PF=$!; sleep 3
+
+# Watch rag-service logs — you will see embed -> retrieve -> generate
+kubectl -n genai logs deploy/rag-service -f &
+LOG=$!
+
+curl -s -X POST http://localhost:8080/rag \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"What is RAG?"}' | python3 -m json.tool
+
+sleep 2; kill $LOG $PF
+```
+
+---
+
+## Trace: ingestion (offline path)
 
 ```
-GCS bucket ──► cronjob seed-docs (gsutil rsync) ──► /data/docs (rag-data PVC)
-                                                     │
-rag-ingest (python -m ingest --dir /data/docs):      ▼
-    chunk every .md/.txt ──► embed via TEI ──► upsert into /data/chroma
+GCS bucket ──► seed-docs (gsutil rsync) ──► /data/docs (rag-data PVC)
+                                              │
+rag-ingest (python -m ingest):                ▼
+    chunk .md/.txt ──► embed via TEI ──► upsert into /data/chroma
 ```
 
-**Why this shape:** two different processes (the always-on rag-service reading
-and the batch ingest writing) touch the same volume — the reason `rag-data` is
-RWX (NFS) rather than RWO.
+```bash
+# Trigger a manual ingest and watch the flow
+kubectl create job --from=cronjob/rag-ingest rag-ingest-manual -n genai
+kubectl -n genai logs -f job/rag-ingest-manual
+```
 
-## Keeping integrations consistent
+---
 
-Three things must always line up:
+## Keeping integrations consistent (the 3 rules)
 
-1. **Embedding model** — same value (`BAAI/bge-small-en-v1.5`) at ingest and
-   query time, or retrieval breaks.
-2. **LLM model name** — the gateway and rag-service `LLM_MODEL` must equal what
-   the serving backend exposes (`qwen2.5:0.5b` for Ollama, `genai-model` for
-   vLLM).
-3. **URLs** — each service's endpoint variables must point at the correct
-   Kubernetes service names.
+```bash
+# Rule 1: embedding model — same at ingest AND query
+kubectl -n genai get cronjob rag-ingest -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].env}' | grep EMBEDDING_MODEL
+kubectl -n genai get deploy rag-service -o jsonpath='{.spec.template.spec.containers[0].env}' | grep EMBEDDING_MODEL
 
-Because these are all plain environment variables in the manifests, keeping the
-integration working is mostly a matter of keeping these settings in sync.
+# Rule 2: LLM model name — gateway and rag-service match the served model
+kubectl -n genai get deploy gateway -o jsonpath='{.spec.template.spec.containers[0].env}' | grep LLM_MODEL
+kubectl -n genai get deploy rag-service -o jsonpath='{.spec.template.spec.containers[0].env}' | grep LLM_MODEL
 
-## Failure signatures of mis-wiring
+# Rule 3: service URLs — point at the right Kubernetes service names
+kubectl -n genai get deploy gateway -o jsonpath='{.spec.template.spec.containers[0].env}' | grep -E 'LLM_URL|RAG_URL'
+```
 
-- `/rag` answers generically with zero docs found => either the store isn't
-  populated, or embedding model mismatch.
-- `404 model not found` from `/chat` => `LLM_MODEL` doesn't match what the
-  serving backend exposes.
-- `ImagePullBackOff` on EVERY pod => the overlay (registry rewrite) wasn't
-  applied — pods requested `docker.io/genai/...`.
+---
+
+## Failure signatures (what to check)
+
+| Symptom | Check |
+|---------|-------|
+| `/rag` answers generically with no docs | `kubectl exec deploy/rag-service -- python -c "from config import get_store; print(get_store()._collection.count())"` — count must be > 0 |
+| `404 model not found` from `/chat` | `LLM_MODEL` env var does not match served model — check both |
+| `ImagePullBackOff` on every pod | You applied `k8s/base` not `k8s/overlays/prod` — reapply the overlay |
+| `Connection refused` from gateway -> LLM | `serving-llm` pod is not ready — `kubectl -n genai get pods` |

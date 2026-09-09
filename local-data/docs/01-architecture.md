@@ -1,8 +1,7 @@
-# Architecture — Structure, Rationale & Service Inventory
+# Architecture — From ZERO to Live (Structure, Rationale & Service Inventory)
 
-This document maps the whole platform: the moving parts, how the data flows,
-why each layer exists, and a complete inventory of every running component. Read
-this first to build a mental model, then use the other files for the details.
+This file maps the whole platform from 0: the moving parts, how the data flows,
+why each layer exists, and how to inspect every piece with real commands.
 
 ## The layers (and why each exists)
 
@@ -31,204 +30,221 @@ STORAGE / CLUSTER (GKE nodes, ingress,        WHY: containers are ephemeral, so
 
 ### 1. The gateway — why add it
 Clients should never depend on individual backend URLs or the served model name.
-If you later swap vLLM for Ollama (or add a third backend), the client keeps
-calling `/chat` and never notices. It also gives you ONE place to enforce an API
-key, rate limits, and logging.
+If you swap vLLM for Ollama, the client keeps calling `/chat` and never notices.
 
 ### 2. The RAG service — why add it
 Retrieval (embed + search Chroma + build a grounded prompt) is a full
-algorithmic chain. Isolating it as its own service lets it scale independently
-and keeps the gateway tiny. It shares the LLM and the embedding endpoints, so no
-duplicate compute.
+algorithmic chain. Isolating it keeps the gateway tiny and scales independently.
 
 ### 3. The embedding server (TEI) — why add it
-RAG must turn text into vectors, and the SAME model must be used at ingest-time
-and query-time. A dedicated embedding server guarantees a single, stable
-embedding model (`BAAI/bge-small-en-v1.5`) for all stages. Without this
-consistency, retrieval returns unrelated chunks.
+A dedicated server guarantees the **same model** (`BAAI/bge-small-en-v1.5`) is
+used at ingest and query time — without this consistency, retrieval returns
+nonsense.
 
 ### 4. The LLM server (Ollama/vLLM) — why add it
-A RAG system still needs a language model to write the final answer. Running it
-in-cluster (instead of an external API) keeps prompts/sensitive docs internal.
-Both backends expose an OpenAI-compatible API so callers never change.
+Running it in-cluster keeps prompts and sensitive documents internal. Both
+backends expose an OpenAI-compatible API so callers never change.
 
 ### 5. Chroma vector database — why add it
-Plain text search fails on meaning ("I lost my password" ≠ "password").
-Embeddings + a vector index give semantic search. Persisting it on a shared,
-read-write-many volume (`rag-data`) lets the ingest job write and the service
-read at the same time, and survive restarts.
+Embeddings + a vector index give semantic search. Persisted on a shared
+read-write-many volume so ingest writes and the service reads at the same time.
 
 ### 6. Persistent storage (PVCs) — why add it
-Containers are throwaway. Model weights (hundreds of MB/GB), the vector DB, and
-source docs must survive pod restarts. Without PVCs every restart would
-re-download models and lose your index.
+Containers are throwaway. Model weights, vector DB, and source docs must survive
+pod restarts.
 
 ### 7. Cluster + nodes — why add it
-Deployment, scaling, self-healing, and rolling updates are handled by GKE. Node
-pools separate CPU workloads from the (future) GPU pool so pasting a GPU upgrade
-cannot affect CPU services.
+GKE handles deployment, scaling, self-healing, and rolling updates.
 
 ### 8. Ingress / LoadBalancer — why add it
-A stable public address that load-balances across healthy gateway pods. The load
-balancer health-checks backend instances so unhealthy nodes are taken out of
-rotation automatically.
+A stable public address that health-checks backend instances and only routes to
+healthy ones.
+
+## Inspect the architecture from your terminal
+
+### Verify the cluster exists and nodes are ready
+
+```bash
+gcloud container clusters describe genai-cluster --region=us-central1 \
+  --format="value(currentNodeVersion, currentNodeCount)"
+gcloud container node-pools list --cluster genai-cluster --region=us-central1
+```
+
+### Verify every deployment is running
+
+```bash
+kubectl -n genai get deploy
+# NAME              READY   UP-TO-DATE   AVAILABLE
+# gateway           2/2     2            2
+# rag-service       1/1     1            1
+# serving-llm       1/1     1            1
+# serving-embedding 1/1     1            1
+```
+
+### Verify the storage classes exist
+
+```bash
+kubectl get sc
+# NAME                 PROVISIONER                    RECLAIMPOLICY
+# premium-rwo          pd.csi.storage.gke.io          Delete
+# nfs-filestore        filestore.csi.storage.gke.io   Delete
+```
+
+### Verify the PVCs are bound
+
+```bash
+kubectl -n genai get pvc
+# NAME           STATUS   VOLUME                                     CAPACITY
+# model-store    Bound    pvc-xxxx                                  50Gi
+# embed-store    Bound    pvc-yyyy                                  10Gi
+# rag-data       Bound    pvc-zzzz                                  100Gi
+```
+
+### Verify services have DNS names
+
+```bash
+kubectl -n genai get svc
+# NAME                 TYPE        CLUSTER-IP    PORT
+# gateway              ClusterIP   10.x.x.x      80/TCP
+# serving-llm          ClusterIP   10.x.x.x      8000/TCP
+# serving-embedding    ClusterIP   10.x.x.x      8001/TCP
+# rag-service          ClusterIP   10.x.x.x      8080/TCP
+```
+
+### Verify the LoadBalancer has a public IP
+
+```bash
+kubectl -n genai get svc gateway-lb
+# NAME         TYPE           CLUSTER-IP    EXTERNAL-IP
+# gateway-lb   LoadBalancer   10.x.x.x      34.63.204.167
+```
 
 ## The data flows
 
 **Chat path (no documents):**
 `client -> gateway -> LLM -> gateway -> client`
 
+```bash
+curl -s -X POST http://34.63.204.167/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Hello"}]}'
+```
+
 **RAG path (grounded in documents):**
 `client -> gateway -> rag-service -> embedding(TEI) -> Chroma retrieval
          -> rag-service -> LLM -> gateway -> client`
 
+```bash
+curl -s -X POST http://34.63.204.167/rag \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"What is RAG?"}'
+```
+
 **Ingestion path (offline):**
 `docs (/data/docs or GCS) -> chunk + embed(TEI) -> store in Chroma (rag-data)`
+
+```bash
+kubectl create job --from=cronjob/rag-ingest rag-ingest-manual -n genai
+kubectl logs -n genai job/rag-ingest-manual --tail=5
+# Ingested ... -> N chunks
+```
 
 ## Storage decisions
 
 | Data | Where | Why |
 |------|-------|-----|
-| LLM weights | `model-store` (premium-rwo, SSD, RWO) | Fast, single writer (the LLM pod) |
+| LLM weights | `model-store` (premium-rwo, SSD, RWO) | Fast, single writer |
 | Embedding model | `embed-store` (premium-rwo) | TEI loads it locally |
-| Chroma vectors + docs | `rag-data` (Filestore, RWX) | Shared by rag-service (reads) and ingest (writes) simultaneously |
+| Chroma vectors + docs | `rag-data` (Filestore, RWX) | Shared by rag-service and ingest |
 
-The RWO/RWX distinction is the key lesson: any data shared by two pods at once
-must be on a read-write-many volume.
-
-## Infrastructure that binds it together
-
-- **GKE cluster** (`genai-cluster`) hosts every deployment.
-- **Node pools** — `cpu-pool` for current workloads; `gpu-pool` (L4) reserved
-  for larger models once GPU quota is granted.
-- **Artifact Registry** stores the built images; the cluster pulls from it.
-- **Ingress + static IP** — a reserved global IP fronts the gateway, providing
-  a stable external address and HTTP load balancing.
-- **Terraform** declares the cluster, pools, registry, and IP; **k8s manifests**
-  declare the workloads.
-
-## Request lifecycle with Kubernetes
-
-1. A request arrives at the Ingress (static IP) and is routed to the gateway
-   Service.
-2. Kubernetes load-balances across gateway pods.
-3. The gateway calls other services over their stable DNS names.
-4. Each service is kept healthy by readiness/liveness probes; if one crashes,
-   Kubernetes restarts or reschedules it.
+```bash
+kubectl -n genai get pvc -o custom-columns=\
+  "NAME:.metadata.name,SC:.spec.storageClassName,CAP:.spec.resources.requests.storage"
+```
 
 ## Design rules
 
 - **Single entry:** clients reach only the gateway.
 - **OpenAI-compatible seams:** swapping backends changes config, never code.
-- **Shared store**: one Chroma volume, one collection (`knowledge_base`), two
+- **Shared store:** one Chroma volume, one collection (`knowledge_base`), two
   writers (ingest) and readers (service).
-- **Fail-safe storage classes**: `premium-rwo` where one pod reads/writes;
+- **Fail-safe storage classes:** `premium-rwo` where one pod reads/writes;
   `nfs-filestore` (RWX) where multiple pods need the same volume.
 
 ---
 
 # Complete Service Inventory
 
-A thorough inventory of every running component: what it is, who talks to it,
-and why it is used.
-
 ## 1. gateway (Deployment, FastAPI, :80)
-- **What:** public API door: `/chat`, `/rag`, `/models`, `/healthz`, and a
-  browser UI at `/`.
-- **Talks to:** serving-llm (chat), rag-service (/rag), TEI indirectly.
-- **Why:** a single stable entry point so clients never know the cluster
-  internals; one place for auth (optional `API_KEY`), validation, and logging.
+```bash
+kubectl -n genai describe deploy gateway
+kubectl -n genai logs deploy/gateway --tail=5
+```
 
 ## 2. rag-service (Deployment, FastAPI, :8080)
-- **What:** runs the answer chain: embed query -> retrieve top-k chunks from
-  Chroma -> build grounded prompt -> call the LLM -> return `{answer}`.
-- **Talks to:** serving-embedding, Chroma (on `rag-data`), serving-llm.
-- **Why:** retrieval is a separate, scaling concern; isolating it keeps the
-  gateway thin and testable.
+```bash
+kubectl -n genai describe deploy rag-service
+kubectl -n genai logs deploy/rag-service --tail=5
+```
 
 ## 3. serving-llm (Deployment — Ollama :8000 / vLLM :8000)
-- **What:** hosts the language model. Currently Ollama serving `qwen2.5:0.5b`
-  (OpenAI-compatible `/v1/chat/completions`). The GPU path would use vLLM with
-  `genai-model`.
-- **Talks to:** anyone calling its OpenAI-compatible API (gateway, rag-service).
-- **Why:** self-hosting keeps prompts and documents in-cluster; the
-  OpenAI-compatible seam makes backend swaps a config change, not a code change.
+```bash
+kubectl -n genai describe deploy serving-llm
+kubectl -n genai logs deploy/serving-llm --tail=5
+```
 
 ## 4. serving-embedding (Deployment — TEI, :8001)
-- **What:** exposes `/embeddings` for one model (`BAAI/bge-small-en-v1.5`),
-  providing 384-dim vectors.
-- **Talks to:** rag-service + rag-ingest at both ingest and query time.
-- **Why:** a dedicated, consistent embedder is what makes semantic retrieval
-  work; the same model in both phases is why results are meaningful.
+```bash
+kubectl -n genai describe deploy serving-embedding
+```
 
 ## 5. rag-ingest (CronJob, every 6h)
-- **What:** seeds `/data/docs` from a GCS bucket (`seed-docs` initContainer)
-  then embeds + upserts all `.md`/`.txt` chunks into the Chroma collection
-  `knowledge_base` on `/data/chroma`.
-- **Why:** documents change; the vector index must track them. Scheduled
-  ingestion keeps the knowledge base fresh without manual work.
+```bash
+kubectl -n genai get cronjob rag-ingest
+kubectl create job --from=cronjob/rag-ingest rag-ingest-manual -n genai
+kubectl -n genai logs job/rag-ingest-manual --tail=5
+```
 
 ## 6. Chroma vector database (on `rag-data` PVC)
-- **What:** a local, SQLite-backed vector store holding ~122 chunks across 16
-  documents today.
-- **Why:** semantic search over chunks — the mechanism that makes grounded
-  RAG answers possible. Persisted on shared RWX storage so it survives restarts.
+```bash
+R=$(kubectl get pod -n genai -l app=rag-service -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n genai "$R" -- python -c \
+  "from config import get_store; print('count:', get_store()._collection.count())"
+```
 
 ## 7. model-store / embed-store (PVCs, premium-rwo)
-- **What:** durable volumes for LLM weights and the embedding model.
-- **Why:** avoid re-downloading multi-GB weights on every restart; SSD-backed,
-  single-writer access is the right profile for "one pod owns the data".
+```bash
+kubectl -n genai get pvc model-store embed-store
+```
 
 ## 8. rag-data (PVC — Filestore / NFS, RWX)
-- **What:** shared volume holding `/data/docs` and `/data/chroma`.
-- **Why:** read-write-many is the ONLY class that lets the batch write (ingest)
-  and the online read (rag-service) coincide without RWO conflicts.
+```bash
+kubectl -n genai get pvc rag-data
+```
 
-## 9. nfs-filestore (StorageClass)
-- **What:** maps PVCs to a Google Filestore instance (tier `basic-hdd`) over
-  NFS with the Filestore CSI driver.
-- **Why:** GKE has no built-in RWX volume — Filestore is the managed way to
-  get one for shared data.
+## 9. gateway-lb (Service, type: LoadBalancer)
+```bash
+kubectl -n genai get svc gateway-lb
+```
 
-## 10. gateway-lb (Service, type: LoadBalancer)
-- **What:** the public TCP load balancer in front of the gateway
-  (external IP `34.63.204.167`).
-- **Why:** a reachable-from-the-internet address that health-checks the nodes
-  and only routes to healthy ones.
+## 10. Artifact Registry repo `genai`
+```bash
+gcloud artifacts docker images list \
+  us-central1-docker.pkg.dev/aiml-project-idp/genai
+```
 
-## 11. genai-gateway Ingress (declared but stalled)
-- **What:** the GCE Ingress intended to front the gateway plus the reserved
-  global static IP `136.68.152.87`.
-- **Why attempted:** a stable, product-style entry with a reserved IP.
-  **State:** the GCE ingress controller has not provisioned forwarding rules —
-  that is the open item to fix if you want the reserved IP instead of the LB's
-  ephemeral one.
+## 11. model-loader (initContainer image)
+```bash
+kubectl -n genai get pod -l app=serving-llm -o jsonpath='{.items[0].spec.initContainers[*].name}'
+```
 
-## 12. gateway / rag-service / serving-* ClusterIP Services
-- **What:** in-cluster stable DNS + L4 load balancing per workload.
-- **Why:** pods regenerate names/IPs constantly; services give fixed,
-  human-readable addresses (`serving-llm`, `rag-service`, ...) that config
-  files can rely on.
+## 12. GKE node pools (cpu-pool / gpu-pool)
+```bash
+gcloud container node-pools list --cluster genai-cluster --region=us-central1
+```
 
-## 13. Artifact Registry repo `genai`
-- **What:** stores `gateway:1.0.0`, `rag:1.0.0`, `model-loader:1.0.0` images.
-- **Why:** the source of truth for images; nodes pull from here; versioned tags
-  enable rollbacks.
-
-## 14. model-loader (initContainer image)
-- **What:** downloads models into the shared volume before the real container
-  starts (used by serving-embedding and the LLM).
-- **Why:** predictable readiness — new pods start only after weights exist
-  locally instead of hammering Hugging Face on first boot.
-
-## 15. GKE node pools (cpu-pool / gpu-pool)
-- **What:** compute for everything (cpu-pool: 3x e2-standard-8); gpu-pool is
-  declared, disabled by quota.
-- **Why:** separates CPU workloads and (future) GPU workloads; a GPU change
-  could then not disturb CPU services.
-
-## 16. Monitoring, secrets, and namespaces
-- **What:** `monitoring/` for alerts; `gateway-secret`, `hf-secret` for keys;
-  the `genai` namespace isolates everything.
-- **Why:** alert on failures, keep keys out of pods/env, and give every
-  resource a home one `kubectl -n genai` away.
+## 13. Monitoring, secrets, and namespaces
+```bash
+kubectl -n genai get secrets
+kubectl -n genai get pods --field-selector=status.phase!=Running
+```

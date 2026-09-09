@@ -1,153 +1,242 @@
-# CI/CD Pipeline — How Changes Reach the Running Platform
+# CI/CD Pipeline — From 0 to Live
 
-CI/CD stands for **Continuous Integration** and **Continuous Deployment**. It is
-the automated pipeline that takes a code change, tests it, builds it, ships it,
-and puts it live — with as little human clicking as possible.
+Every command to set up, run, verify, and debug the GitHub Actions CI/CD
+pipeline with Workload Identity Federation.
 
-## The pipeline at a glance
+## Pipeline at a glance
 
 ```
-1 push/PR  ->  2 WIF auth  ->  3 lint+test  ->  4 build amd64  ->  5 push images
-                                                                    |
-6 apply manifests (kubectl)  <--  ArgoCD/GitOps also possible  <----+
-7 rolling update + probes  ->  8 health check  ->  9 done, rollback possible
+push/PR → WIF auth → build amd64 → push to registry → apply manifests → rolling update → health check
 ```
-
-Everything is driven by **GitHub Actions** (the CI part) plus either **kubectl**
-or **ArgoCD** (the CD part). Git is the single source of truth: whatever is in
-the repository is what should be running.
 
 ---
 
-## Step 1 — Trigger (push / pull request). Why?
+## Step 1: Set up Workload Identity Federation (WIF)
 
-When you push to the repository, GitHub Actions detects the event and starts a
-workflow defined in `.github/workflows/build-push.yml`. Every deploy must start
-from an explicit event so changes are traceable to a commit.
+### 1.1 Create the identity pool
 
-**Why:** without a trigger, deployments are manual, unrepeatable, and nobody can
-say "what version is live?".
-
-## Step 2 — Workload Identity Federation (WIF). Why?
-
-The pipeline must authenticate to GCP without storing a secret in the repo.
-WIF lets GitHub exchange its OIDC token for short-lived Google credentials. The
-workflow config provides:
-
-- `PROJECT_ID` — `aiml-project-idp`
-- `WIF_PROVIDER` — the identity provider resource
-- `WIF_SERVICE_ACCOUNT` — the service account with permission to write images
-
-**Why:** no long-lived service-account key to rotate, leak, or revoke.
-
-## Step 3 — Lint + tests. Why?
-
-Catch breakage before it ships into a shared cluster. Example: the gateway
-PyData/CORS, config sanity, response-model checks.
-
-**Why:** a test caught early costs seconds; the same bug caught live costs a
-rollback and support.
-
-## Step 4 — Build `linux/amd64` images. Why?
-
-The pipeline builds three first-party images:
-
-- `genai/gateway` — the API gateway
-- `genai/rag` — the RAG service and ingest job
-- `genai/model-loader` — downloads models into the shared volume
-
-GKE nodes are x86. If you build on an Apple Silicon laptop and forget
-`--platform linux/amd64`, the image will not run on the cluster's amd64 nodes
-(you get the famous `exec format error`). Cloud Build runs on x86 machines, so
-the artifact is always the target architecture.
-
-## Step 5 — Push to Artifact Registry. Why?
-
-Images are pushed to Google **Artifact Registry**:
-
-```
-us-central1-docker.pkg.dev/aiml-project-idp/genai/<name>:1.0.0
+```bash
+gcloud iam workload-identity-pools create github-pool \
+  --location=global --display-name="GitHub Actions Pool"
 ```
 
-Images are **versioned** (e.g. `1.0.0`) rather than using `:latest`, because
-versioned tags make builds reproducible and make rollbacks possible.
+### 1.2 Create the OIDC provider
 
-**Why:** a registry is how nodes get images at all; versioned tags are how you
-can revert safely.
+```bash
+gcloud iam workload-identity-pools providers create-oidc github-provider \
+  --workload-identity-pool=github-pool --location=global \
+  --attribute-mapping="google.subject=assertion.sub,attribute.actor=assertion.actor,attribute.repository=assertion.repository" \
+  --issuer-uri="https://token.actions.githubusercontent.com" \
+  --attribute-condition="assertion.repository_owner == 'premrasapalli'"
+```
 
-## Step 6 — Apply the Kubernetes manifests. Why?
+### 1.3 Create the service account
 
-Once images exist in Artifact Registry, the running cluster needs to start using
-the new versions. Two modes:
+```bash
+gcloud iam service-accounts create github-actions \
+  --display-name="GitHub Actions SA"
+```
 
-- **Manual kubectl** — run `kubectl apply -k k8s/overlays/prod` to apply the
-  Kubernetes manifests. This is great for development and for a demo.
-- **ArgoCD (GitOps)** — a controller inside the cluster continuously watches
-  the git repo and automatically reconciles the cluster to match it.
+### 1.4 Grant it permission to be impersonated
 
-**Why:** deployment = telling Kubernetes the desired state; without this step new
-images are pushed but never used.
+```bash
+gcloud iam service-accounts add-iam-policy-binding \
+  github-actions@aiml-project-idp.iam.gserviceaccount.com \
+  --role="roles/iam.workloadIdentityUser" \
+  --member="principalSet://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/github-pool/attribute.repository/premrasapalli/gke-genai-deployment"
+```
 
-## Step 7 — Rolling update with probes. Why?
+### 1.5 Grant token-creator + Artifact Registry writer
 
-When new pod definitions reach the cluster, Kubernetes performs a **rolling
-update**:
+```bash
+gcloud projects add-iam-policy-binding aiml-project-idp \
+  --member="serviceAccount:github-actions@aiml-project-idp.iam.gserviceaccount.com" \
+  --role="roles/iam.serviceAccountTokenCreator"
 
-1. A new ReplicaSet is created with the new pod definition.
-2. It starts a new pod with the new image.
-3. Readiness probes (`/healthz`, `/api/tags`, etc.) are used to check the new
-   pod is actually healthy.
-4. Only then is an old pod terminated.
+gcloud artifacts repositories add-iam-policy-binding genai \
+  --location=us-central1 \
+  --member="serviceAccount:github-actions@aiml-project-idp.iam.gserviceaccount.com" \
+  --role="roles/artifactregistry.writer"
+```
 
-Because we set `imagePullPolicy: Always` on our app containers, each new pod
-pulls the exact latest `1.0.0` tag rather than reusing a cached copy.
+### 1.6 Get the provider resource name
 
-**Why:** zero downtime and no "half-mixed" traffic; a failing new pod blocks the
-rollout instead of taking the service down.
+```bash
+gcloud iam workload-identity-pools providers describe github-provider \
+  --workload-identity-pool=github-pool --location=global \
+  --format="value(name)"
+# Output: projects/784802248985/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+```
 
-## Step 8 — Post-deploy health verification. Why?
+### 1.7 Set GitHub repository Variables and Secrets
 
-Confirm the live URL answers: `GET /healthz` -> ok, `/chat` and `/rag` return.
+```bash
+gh variable set WIF_PROVIDER \
+  --body "projects/784802248985/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
 
-**Why:** green ICMP to a pod ≠ a working RAG chain; verify the contract.
+gh variable set WIF_SERVICE_ACCOUNT \
+  --body "github-actions@aiml-project-idp.iam.gserviceaccount.com"
 
-## Step 9 — Rollback path. Why?
+gh secret set PROJECT_ID --body "aiml-project-idp"
+```
 
-Because deployments fail, the pipeline must define how to revert: point back at
-a previous image tag or previous commit.
-
-- If a new pod fails its readiness probe repeatedly, Kubernetes stops the
-  rollout (it does not keep destroying healthy pods) and reports the pod state
-  like `CrashLoopBackOff`.
-- Because images and manifests are versioned and stored, you can roll back to a
-  previous image tag or a previous git commit.
-- Monitoring (see the `monitoring/` directory) raises alerts if a workload goes
-  down or a node becomes unhealthy, so problems are caught automatically.
-
-**Why:** a documented rollback converts a potential outage into a minutes-long
-fix.
+> **The gotcha we hit:** these must be repository **Variables** (not Secrets)
+> because the workflow reads them via `${{ vars.* }}`.
 
 ---
 
-## Summary: the end-to-end life of a change
+## Step 2: The workflow (`.github/workflows/build-push.yml`)
 
-1. Developer edits code and commits.
-2. GitHub Actions builds and pushes new `1.0.0` images (WIF auth, no secrets).
-3. The change is merged and the manifests are applied (kubectl) — or ArgoCD
-   auto-syncs from git.
-4. Kubernetes rolls out new pods, verifying health with probes.
-5. The gateway's `/healthz` reports the system is healthy; users call `/chat`
-   and `/rag` as normal.
+```yaml
+permissions:
+  contents: read
+  id-token: write          # required for OIDC token exchange
 
-## What actually happened in this project (worked example)
+jobs:
+  build:
+    steps:
+      - uses: actions/checkout@v4
 
-1. We edited `rag/requirements.txt` (chromadb pin) and pushed.
-2. Cloud Build rebuilt `genai/rag:1.0.0` for amd64 and pushed it.
-3. `kubectl rollout restart deploy/rag-service` (imagePullPolicy: `Always`) made
-   new pods pull the fresh tag.
-4. Readiness probes confirmed the new pod healthy; old pod retired.
-5. A manual ingest job re-indexed the docs with the new library.
+      - name: Authenticate to Google Cloud (Workload Identity Federation)
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          token_format: access_token
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.WIF_SERVICE_ACCOUNT }}
+          access_token_lifetime: "600s"
 
-That sequence — build -> push -> restart -> probe -> verify — is the CI/CD flow
-in miniature, and each building block exists only because the previous one had a
-specific GAP it filled.
+      - name: Configure docker for Artifact Registry
+        run: |
+          echo "${{ steps.auth.outputs.access_token }}" | \
+            docker login -u oauth2accesstoken --password-stdin \
+            https://${{ env.REGION }}-docker.pkg.dev
+
+      - name: Build & push gateway
+        uses: docker/build-push-action@v6
+        with:
+          context: gateway
+          push: true
+          tags: ${{ env.REPO }}/gateway:1.0.0
+```
+
+---
+
+## Step 3: Trigger and watch
+
+### Push to main (triggers the workflow)
+
+```bash
+git add . && git commit -m "ci: test pipeline" && git push origin main
+```
+
+### Watch the run
+
+```bash
+gh run list --limit=5
+gh run watch                    # live stream of the running job
+gh run view --log               # full logs after completion
+```
+
+---
+
+## Step 4: Verify each stage
+
+### 4.1 WIF auth passed
+
+```bash
+gh run view --log | grep "Authenticating to Google Cloud"
+# Should show "Successfully authenticated" — no "access denied"
+```
+
+### 4.2 Images were pushed
+
+```bash
+gcloud artifacts docker images list \
+  us-central1-docker.pkg.dev/aiml-project-idp/genai \
+  --sort-by=UPDATE_TIME | head -10
+# gateway:1.0.0, rag:1.0.0, model-loader:1.0.0 with recent timestamps
+```
+
+### 4.3 Pods picked up the new image
+
+```bash
+kubectl -n genai get pods -o wide
+kubectl -n genai describe deploy gateway | grep -A5 Image
+# Image: us-central1-docker.pkg.dev/aiml-project-idp/genai/gateway:1.0.0
+```
+
+### 4.4 Health check from the public IP
+
+```bash
+curl -s http://34.63.204.167/healthz    # {"status":"ok"}
+curl -s http://34.63.204.167/models     # qwen2.5:0.5b
+```
+
+---
+
+## Rolling update (what Kubernetes does in the background)
+
+1. New ReplicaSet created with the new pod definition.
+2. New pod started with the (re-pulled) image — `imagePullPolicy: Always`
+   ensures the latest `1.0.0` is used, not a cached copy.
+3. Readiness probes (`/healthz`) must pass before old pod is terminated.
+4. If the new pod fails probes repeatedly → rollout stops → `CrashLoopBackOff`.
+
+---
+
+## Manual deploy (without CI)
+
+```bash
+# Build locally via Cloud Build (still x86, amd64 images)
+gcloud builds submit --region=us-central1 --config=cloudbuild.yaml .
+
+# Apply manifests
+kubectl apply -k k8s/overlays/prod
+
+# Force new pods to pull the fresh image
+kubectl -n genai rollout restart deploy/gateway deploy/rag-service \
+  deploy/serving-llm deploy/serving-embedding
+```
+
+---
+
+## Rollback
+
+```bash
+# Roll back to previous image tag by editing the overlay
+kubectl -n genai rollout undo deploy/gateway
+kubectl -n genai rollout undo deploy/rag-service
+
+# Or force a previous git commit
+git checkout <commit-sha> -- k8s/
+kubectl apply -k k8s/overlays/prod
+```
+
+---
+
+## What actually happened in this project
+
+1. Edited `rag/requirements.txt` (chromadb pin) and pushed.
+2. GitHub Actions (WIF auth) built `genai/rag:1.0.0` for amd64, pushed to
+   Artifact Registry.
+3. `kubectl rollout restart deploy/rag-service` (imagePullPolicy: `Always`)
+   pulled the fresh tag.
+4. Readiness probes confirmed new pod healthy; old pod retired.
+5. Manual ingest re-indexed docs with the new library.
+
+---
+
+## Summary: what each piece proves
+
+| Piece | Value |
+|-------|-------|
+| Identity Pool | `github-pool` (global) |
+| OIDC Provider | `github-provider` |
+| Service Account | `github-actions@aiml-project-idp.iam.gserviceaccount.com` |
+| WIF Roles | `workloadIdentityUser` + `serviceAccountTokenCreator` |
+| Registry Role | `artifactregistry.writer` on `genai` |
+| GitHub Variables | `WIF_PROVIDER`, `WIF_SERVICE_ACCOUNT` |
+| GitHub Secret | `PROJECT_ID` |
+
+**Result: the whole pipeline works — no keys stored in the repo.**

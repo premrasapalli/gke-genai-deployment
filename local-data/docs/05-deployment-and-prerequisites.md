@@ -1,235 +1,238 @@
-# Deployment, Prerequisites & End-to-End Example
+# Deployment, Prerequisites & End-to-End — From 0 to Live
 
-This file covers everything you need before deploying, how the infrastructure
-is built, and a practical runbook from an empty project to a live RAG demo.
+Every prerequisite check, infrastructure command, and deploy step — from a blank
+machine to a live public URL.
 
 ---
 
-# Prerequisites — What You Must Have, and Why
+## Phase 0 — Prerequisites (from a blank machine)
 
-Before you can deploy you need a set of accounts, tools, and permissions.
-
-## 1. A Google Cloud project
-Everything lives inside one project (`aiml-project-idp`): the cluster, images,
-IP address, and storage. A project gives a clean expense/spend boundary and an
-identity boundary.
-
-## 2. Billing enabled and linked
-Compute, storage, and the load balancer cost money. If no billing account is
-linked, actions like `terraform apply` fail later with confusing quota/denial
-errors.
-
-## 3. `gcloud` CLI + authentication
-Terraform, `kubectl` and every `gcloud ...` command authenticate through your
-user account. Check with `gcloud auth list`; set the project with
-`gcloud config set project aiml-project-idp`.
-
-## 4. `kubectl` + a working cluster context
-`kubectl` is the CLI that drives Kubernetes. All deployments, logs, PVC
-inspection, and port-forwarding happen through it.
+### 0.1 Install tools
 
 ```bash
-gcloud container clusters get-credentials genai-cluster --region us-central1
-kubectl config current-context   # should print the genai cluster
+brew install --cask google-cloud-sdk
+brew install kubectl terraform docker
+brew install gh   # GitHub CLI (optional, used for WIF setup)
 ```
 
-## 5. Terraform
-The cluster, node pools, Artifact Registry, VPC, and static IP are declared as
-code in `terraform/`. Terraform applies exactly the diff you reviewed (`plan`
-before `apply`).
+### 0.2 Authenticate and set project
 
-## 6. Docker (for local builds only)
-Used for reproducing image builds locally. Note: local `docker build` on Apple
-Silicon produces arm64 images that GKE (amd64) refuses with `exec format error`
-— so final images are always built via Cloud Build (x86).
+```bash
+gcloud auth login
+gcloud config set project aiml-project-idp
+gcloud auth application-default login    # for terraform
+```
 
-## 7. Quotas — the one that bites
-Every GPU/CPU/regional resource has a project quota:
+### 0.3 Link billing (this blocked us — fix early)
+
+```bash
+gcloud billing projects link aiml-project-idp \
+  --billing-account=01716C-ECBC7F-34FFF7
+gcloud billing projects describe aiml-project-idp   # billingEnabled: true
+```
+
+### 0.4 Enable required APIs
+
+```bash
+gcloud services enable compute.googleapis.com \
+  container.googleapis.com \
+  artifactregistry.googleapis.com \
+  file.googleapis.com \
+  storage-api.googleapis.com
+```
+
+### 0.5 Check quotas (GPU quota bit us — check before designing)
 
 ```bash
 gcloud compute regions describe us-central1 \
   --format='table(quotas[].metric,quotas[].limit,quotas[].usage)'
+# GPUS_ALL_REGIONS was 0 globally — go CPU-only for now
 ```
 
-In this project the global GPU quota `GPUS_ALL_REGIONS` was **0**, and L4 GPUs
-were only available in `us-central1-a/b/c`. Check quotas BEFORE you design for
-GPUs.
+### 0.6 Get cluster credentials
 
-## 8. An Artifact Registry repo (created by Terraform)
-Built images are pushed to `us-central1-docker.pkg.dev/aiml-project-idp/genai`.
-Without it the image push and the node pulls both fail.
+```bash
+gcloud container clusters get-credentials genai-cluster \
+  --region=us-central1 --project=aiml-project-idp
+kubectl config current-context    # should print the genai cluster
+```
 
-## 9. The node service account with pull rights
-The cluster's nodes pull images using the workload identity service account.
-Grant it `roles/artifactregistry.reader`.
+### 0.7 Verify Docker works locally (arm64 builds will fail on amd64 nodes)
 
-## 10. Source documents (for RAG)
-RAG is only useful with real content. The docs in this repo double as both the
-manual AND the RAG knowledge base.
+```bash
+docker --version
+uname -m   # arm64 = Mac; builds must target linux/amd64 via Cloud Build
+```
 
 ---
 
-# Deploying on GKE with Terraform and Kustomize
+## Phase A — Terraform Infrastructure
 
-## The layers
-
-```
-┌─────────────────────────────────────────────┐
-│ GKE cluster genai-cluster (us-central1)     │
-│  ├─ cpu-pool    3 × e2-standard-8 (CPU)     │
-│  └─ gpu-pool    (disabled: L4 quota)        │
-│                                             │
-│  namespace genai                            │
-│   ├─ gateway:1.0.0        (2 replicas)      │
-│   ├─ rag-service:1.0.0                      │
-│   ├─ serving-llm:1.0.0    (Ollama)          │
-│   ├─ serving-embedding:1.0.0 (TEI)          │
-│   └─ rag-ingest (CronJob)                   │
-└─────────────────────────────────────────────┘
-```
-
-## Terraform (`terraform/`)
-
-| File            | Contents                                     |
-| --------------- | -------------------------------------------- |
-| `providers.tf`  | Google provider + variables (`region`, `gpu_zone`, `enable_gpu_pool`, ...) |
-| `main.tf`       | VPC network, GKE cluster, node pools, artifact repository, static IP |
-| `backend.tf`    | GCS bucket that stores the remote state       |
-| `terraform.tfvars` | Variable values actually applied          |
-
-Key commands:
+### A1. Initialize and apply
 
 ```bash
 terraform init
-terraform plan          # preview changes
-terraform apply         # apply them
-terraform output        # show endpoints (cluster_endpoint, gateway_static_ip)
+terraform plan          # ALWAYS preview first
+terraform apply
 ```
 
-By default the GPU pool is **off** (`enable_gpu_pool = false`). Turning it on
-requires a `GPUS_ALL_REGIONS` quota increase in Google Cloud.
-
-## Container images (`cloudbuild.yaml`)
-
-Images are built for `linux/amd64` and stored in Artifact Registry:
+### A2. Verify infrastructure
 
 ```bash
-gcloud builds submit --region=us-central1 --config=cloudbuild.yaml .
+gcloud container clusters list
+gcloud container node-pools list --cluster genai-cluster --region us-central1
+gcloud artifacts repositories list --location=us-central1
+terraform output
 ```
 
-Build machines are x86, so they always produce amd64 images. The cluster's
-service account has `roles/artifactregistry.reader` so nodes may pull these
-images.
-
-## Kubernetes manifests (`k8s/`)
-
-```
-k8s/base/        all resources: deployments, services, PVCs, ingress,
-                 storage class, cronjob
-k8s/overlays/    environment-specific tweaks on top of base
-```
-
-Apply (from the repo root):
+### A3. GPU pool — disabled by default
 
 ```bash
-kubectl apply -k k8s/base
-kubectl -n genai rollout status deploy/gateway deploy/rag-service \
-  deploy/serving-llm deploy/serving-embedding
+cat terraform/terraform.tfvars | grep enable_gpu_pool
+# enable_gpu_pool = false  (GPUS_ALL_REGIONS quota was 0)
 ```
-
-Important wiring notes:
-
-- **Storage classes**: `premium-rwo` for single-node access (model-store,
-  embed-store), and `nfs-filestore` (Filestore CSI) for shared read-write-many
-  access (rag-data).
-- The **imagePullPolicy is `Always`** so that a rebuild+pull picks up changes
-  even when the tag stays `1.0.0`.
-- Model weights live on a volume mounted by `model-loader` and are not
-  re-downloaded every boot once present.
-
-## Changing something / recreating the cluster
-
-1. Edit Terraform; `terraform plan`; `terraform apply`.
-2. If the state is locked:
-   ```bash
-   terraform force-unlock <lock-id>
-   ```
-3. Node pools and the cluster can be deleted and recreated without touching
-   the app code; storage volumes are persistent and survive cluster rebuilds.
 
 ---
 
-# End-to-End Example: From an Empty Project to a Grounded RAG Demo
+## Phase B — Storage: Filestore CSI driver + storage classes
 
-## 0. Prerequisites (once)
+### B1. Enable Filestore CSI on the cluster
 
-- `gcloud` logged in and billing linked on the project.
-- `kubectl` configured for the cluster:
-  ```bash
-  gcloud container clusters get-credentials genai-cluster --region=us-central1 --project=aiml-project-idp
-  ```
+```bash
+gcloud container clusters update genai-cluster --region us-central1 \
+  --update-addons=GcpFilestoreCsiDriver=ENABLED
+```
 
-## 1. Build and deploy the app
+### B2. Verify storage classes exist after kustomize apply
+
+```bash
+kubectl get storageclass
+# premium-rwo          (default, SSD, RWO)
+# nfs-filestore        (Filestore CSI, RWX — for rag-data)
+```
+
+---
+
+## Phase C — Build and push images (Cloud Build, amd64)
+
+### C1. Build all three images
 
 ```bash
 gcloud builds submit --region=us-central1 --config=cloudbuild.yaml .
-kubectl apply -k k8s/base
-kubectl -n genai wait --for=condition=ready pod -l app=serving-llm --timeout=300s
+```
+
+### C2. Verify images in Artifact Registry
+
+```bash
+gcloud artifacts docker images list \
+  us-central1-docker.pkg.dev/aiml-project-idp/genai
+# gateway:1.0.0, rag:1.0.0, model-loader:1.0.0
+```
+
+### C3. Grant the node SA pull rights
+
+```bash
+gcloud projects add-iam-policy-binding aiml-project-idp \
+  --member="serviceAccount:genai-gke@aiml-project-idp.iam.gserviceaccount.com" \
+  --role=roles/artifactregistry.reader
+```
+
+---
+
+## Phase D — Deploy workloads (Kustomize)
+
+### D1. Apply base + prod overlay
+
+```bash
+kubectl apply -k k8s/overlays/prod
+```
+
+> Base alone carries short image names (`genai/gateway`); the prod overlay
+> rewrites them to the full registry path. Skipping the overlay = pods pull
+> `docker.io/genai/...` and fail.
+
+### D2. Wait for everything to become healthy
+
+```bash
+kubectl -n genai rollout status deploy/gateway deploy/rag-service \
+  deploy/serving-llm deploy/serving-embedding
 kubectl -n genai get pods
 ```
 
-Wait until all workload pods report `1/1 Running`:
-
+Expected:
 ```
-gateway-xxxxxxxxxx-ccccc            2/2     Running
-rag-service-xxxxxxxxxx-ccccc        1/1     Running
-serving-llm-xxxxxxxxxx-ccccc        1/1     Running
-serving-embedding-xxxxxxxxxx-ccccc  1/1     Running
+gateway-xxx            2/2   Running
+rag-service-xxx        1/1   Running
+serving-llm-xxx        1/1   Running
+serving-embedding-xxx  1/1   Running
 ```
 
-## 2. Check the health of the stack
+---
+
+## Phase E — Public URL
+
+### E1. Create the LoadBalancer
 
 ```bash
-kubectl port-forward -n genai svc/gateway 8080:80 >/dev/null & PF=$!
-sleep 5
-curl -s localhost:8080/healthz      # -> {"status":"ok"}
-curl -s localhost:8080/models       # -> qwen2.5:0.5b
-kill $PF
+kubectl -n genai create service loadbalancer gateway-lb --tcp=80:8080 \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n get svc gateway-lb
+# EXTERNAL-IP: 34.63.204.167
 ```
 
-## 3. Seed documents and ingest
+### E2. Verify health from the public IP
 
 ```bash
-R=$(kubectl get pod -n genai -l app=rag-service -o jsonpath='{.items[0].metadata.name}')
-kubectl cp local-data/docs/intro.md genai/$R:/data/docs/
+curl -s http://34.63.204.167/healthz    # {"status":"ok"}
+curl -s http://34.63.204.167/models     # qwen2.5:0.5b
+```
 
+---
+
+## Phase F — Seed RAG knowledge base
+
+### F1. Create GCS bucket and upload docs
+
+```bash
+gcloud storage buckets create gs://aiml-project-idp-rag-docs --location=us-central1
+gcloud storage cp -r local-data/docs gs://aiml-project-idp-rag-docs/docs
+gsutil iam ch \
+  serviceAccount:genai-gke@aiml-project-idp.iam.gserviceaccount.com:objectViewer \
+  gs://aiml-project-idp-rag-docs
+```
+
+### F2. Run manual ingest
+
+```bash
 kubectl create job --from=cronjob/rag-ingest rag-ingest-manual -n genai
 kubectl wait --for=condition=complete job/rag-ingest-manual -n genai --timeout=300s
 kubectl logs -n genai job/rag-ingest-manual --tail=5
+# Ingested ... -> N chunks
 ```
 
-Expect: `Ingested ... -> N chunks` and `Done. Total chunks: N`.
-
-## 4. Verify the vector store persisted
+### F3. Verify vector store persisted
 
 ```bash
 R=$(kubectl get pod -n genai -l app=rag-service -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n genai "$R" -- ls /data/chroma   # chroma.sqlite3 must exist
 kubectl exec -n genai "$R" -- python -c "from config import get_store; print(get_store()._collection.count())"
-kubectl exec -n genai "$R" -- ls /data/chroma
+# > 0
 ```
 
-You should see a non-zero count and a `chroma.sqlite3` file.
-
-## 5. Ask grounded questions
+### F4. Test RAG
 
 ```bash
-kubectl port-forward -n genai svc/gateway 8080:80 >/dev/null & PF=$!
-sleep 5
-curl -s -X POST localhost:8080/rag \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"What endpoints does the API gateway expose?"}'
-kill $PF
+curl -s -X POST http://34.63.204.167/rag -H 'Content-Type: application/json' \
+  -d '{"query":"What is RAG?"}' | python3 -m json.tool
+# Grounded answer citing your docs
 ```
 
-A healthy answer quotes the gateway's actual endpoints (`/healthz`, `/models`,
-`/chat`, `/rag`) and cites the context — proof the model read your document.
+---
+
+## Teardown (in order)
+
+```bash
+kubectl delete -k k8s/base            # remove workloads first
+terraform destroy                      # then infrastructure
+# Note: PVCs persist until explicitly deleted
+```

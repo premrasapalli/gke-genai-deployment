@@ -6,8 +6,8 @@ ask questions grounded in your own documents, and manage the whole thing with
 version-controlled infrastructure and code.
 
 Think of it as a "self-hosted AI assistant" — no calls to closed APIs, no keys
-for an external provider. Instead, everything runs inside your own cloud
-cluster using open-source tools.
+for an external provider. Everything runs inside your own cloud cluster using
+open-source tools.
 
 ## The four big building blocks
 
@@ -29,48 +29,44 @@ cluster using open-source tools.
    defined in Terraform and deployed with Kubernetes manifests, so the whole
    platform is reproducible, reviewable, and GitOps-ready.
 
-## Quick reference
+## Quick reference — what is running
 
-### Model Serving
+| Service               | Port | What it does                                    |
+|-----------------------|------|-------------------------------------------------|
+| gateway               | 80   | FastAPI entry point: `/chat`, `/rag`, `/models`, `/healthz` |
+| serving-llm           | 8000 | LLM inference (Ollama CPU or vLLM GPU)          |
+| serving-embedding     | 8001 | TEI embeddings (`BAAI/bge-small-en-v1.5`)       |
+| rag-service           | 8080 | Retrieve from Chroma + generate grounded answer |
+| rag-ingest            | —    | CronJob: chunk docs, embed, store in Chroma     |
 
-The project serves LLMs using **vLLM**, an OpenAI-compatible inference server.
-Models are pulled into a shared model volume and served on port 8000 with a
-`/v1` OpenAI-compatible API. A lightweight alternative, **Ollama**, is provided
-for local or low-resource runs on port 11434.
+## Verify the platform is live (from zero)
 
-### RAG Pipeline
+After completing `07-implementation-guide.md`, confirm everything works:
 
-RAG (Retrieval Augmented Generation) improves LLM answers by retrieving
-relevant context before generation. This project indexes documents into a
-**Chroma** vector database. Ingestion loads markdown and text files, splits them
-into chunks, and stores embeddings. At query time, the retriever performs a
-similarity search and passes the top-k chunks into the prompt as context.
+```bash
+# Check all pods are running
+kubectl -n genai get pods
 
-### API Gateway
+# Health check via port-forward
+kubectl port-forward -n genai svc/gateway 8080:80 >/dev/null & PF=$!
+sleep 5
+curl -s localhost:8080/healthz       # {"status":"ok"}
+curl -s localhost:8080/models        # qwen2.5:0.5b
 
-A FastAPI gateway is the single front door of the platform. It exposes:
+# Plain chat
+curl -s -X POST localhost:8080/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Say hello"}]}'
 
-| Endpoint | Method | What it does                                            |
-| -------- | ------ | ------------------------------------------------------- |
-| `/healthz` | GET | Liveness check; returns `{"status":"ok"}`.            |
-| `/models`  | GET | Reports which LLM is being served (e.g. `qwen2.5:0.5b`). |
-| `/chat`    | POST | Sends a prompt to the LLM and returns the plain chat answer. |
-| `/rag`     | POST | Retrieves relevant document chunks from Chroma, then generates a grounded answer. |
+# RAG grounded question
+curl -s -X POST localhost:8080/rag \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"What endpoints does the API gateway expose?"}'
+kill $PF
+```
 
-Example chat call: `POST /chat` with `{"prompt": "What is a token?"}` returns
-`{"answer": "..."}`. Example RAG call: `POST /rag` with
-`{"query": "How are models served?"}` returns an answer grounded in this
-knowledge base.
-
-### Infrastructure
-
-Terraform provisions a GKE cluster and Artifact Registry on GCP. Deployments
-are Kubernetes manifests ready for GitOps with ArgoCD.
-
-### Embeddings
-
-Embeddings are produced from an OpenAI-compatible embedding endpoint on port
-8001. Use the same embedding model at ingestion and query time.
+If the RAG answer quotes `/healthz`, `/models`, `/chat`, `/rag` — the whole
+platform is live from 0.
 
 ## Who is this for?
 
